@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+results/live*.jsonl
+results/live*_summary.json
+results/live*_errors.jsonl

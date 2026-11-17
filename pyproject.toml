@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-mcp-security-lab"
+version = "0.1.0"
+description = "An isolated MCP agent lab for measuring synthetic tool-abuse attacks and defenses."
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.12,<2", "groq>=1.2,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+agent-mcp-lab = "lab.cli:main"
+
+[tool.setuptools]
+packages = ["lab"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

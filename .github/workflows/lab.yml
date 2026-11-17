@@ -1,0 +1,54 @@
+name: Lab validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_live:
+        description: Run Groq experiments using the repository GROQ_API_KEY secret
+        type: boolean
+        default: false
+      model:
+        description: Groq model with tool calling enabled
+        type: string
+        default: openai/gpt-oss-20b
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q
+
+  live:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install .
+      - name: Run baseline and defended agents
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LAB_MODEL: ${{ inputs.model }}
+        run: python -m lab live --model "$LAB_MODEL" --repeats 3 --output results/live_ci.jsonl
+      - name: Upload complete or partial synthetic evidence
+        if: always() && hashFiles('results/live_ci*') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: live-agent-evidence
+          path: results/live_ci*
+          if-no-files-found: error
+          retention-days: 7
