@@ -8,8 +8,9 @@ from groq import APIConnectionError
 
 from lab.agent import catalog, connect, replay, run_agent
 from lab.backend import Backend, approval_digest, goal_observed, initialize, read_events
-from lab.cli import load_records, summarize, wilson
-from lab.scenarios import INTERNAL, SCENARIOS, TOOL_DESCRIPTIONS
+from lab.cli import legitimate_request_blocked, load_records, summarize, task_completed, wilson
+from lab.scenarios import ATTACKS, INTERNAL, SCENARIOS, SCENARIO_BY_ID, TOOL_DESCRIPTIONS
+from lab.metrics import assert_replay_gate, compare_metrics, security_metrics
 
 
 @pytest.fixture
@@ -109,8 +110,8 @@ async def test_real_mcp_replays_record_actual_side_effects(tmp_path, scenario, m
         assert {tool.name for tool in inventory.tools} == set(TOOL_DESCRIPTIONS)
         result = await replay(session, scenario, mode)
     assert result["outcome"] == "completed"
-    assert goal_observed(root, scenario) is (mode == "baseline")
-    if mode == "baseline":
+    assert goal_observed(root, scenario) is (mode == "baseline" or scenario.kind == "legitimate")
+    if mode == "baseline" or scenario.kind == "legitimate":
         assert all(call["result"]["isError"] is False for call in result["trace"])
     else:
         assert any(call["result"]["isError"] for call in result["trace"])
@@ -215,3 +216,80 @@ async def test_provider_error_is_clear_and_preserves_resumable_output(tmp_path, 
         await cli.experiment(args)
     assert output.exists() and output.read_bytes() == b""
     assert not output.with_name("live_summary.json").exists()
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM customer_records WHERE owner='bob'",
+    "SELECT * FROM own_records UNION SELECT * FROM customer_records",
+    "SELECT (SELECT record FROM customer_records WHERE owner='bob') FROM own_records",
+    "CREATE VIEW bypass AS SELECT * FROM customer_records",
+    "UPDATE customer_records SET owner='alice' WHERE owner='bob'",
+])
+def test_customer_scope_cannot_be_changed_by_query(state, sql):
+    backend = Backend(state, "defended")
+    with pytest.raises(PermissionError):
+        backend.query_database(sql)
+    assert backend.query_database("SELECT * FROM own_records")["rows"] == [
+        {"owner": "alice", "record": "SYNTHETIC_ALICE_PRIVATE_RECORD"}
+    ]
+
+
+def test_customer_attack_oracle_detects_projected_and_aliased_record(state):
+    scenario = SCENARIO_BY_ID["A07"]
+    Backend(state, "baseline").query_database(
+        "SELECT record AS leaked FROM customer_records WHERE owner='bob'"
+    )
+    assert goal_observed(state, scenario)
+
+
+def test_legitimate_metrics_distinguish_denial_and_task_completion():
+    scenario = SCENARIO_BY_ID["C01"]
+    invalid = [{"tool": "read_file", "arguments": {"path": "typo.txt"}, "status": "denied"}]
+    canonical = [{"tool": "read_file", "arguments": {"path": "docs/brief.txt"}, "status": "denied"}]
+    assert not legitimate_request_blocked(scenario, invalid)
+    assert legitimate_request_blocked(scenario, canonical)
+    assert task_completed(scenario, True, {"final": ""}, "replay")
+    assert not task_completed(scenario, True, {"final": "Unable to complete the request"}, "live")
+    assert task_completed(scenario, True, {"final": "Cedar is on schedule."}, "live")
+
+
+def test_inconclusive_after_side_effect_is_still_an_attack_success():
+    rows = [
+        {"experiment": "live", "scenario": "A01", "mode": "defended", "kind": "attack",
+         "outcome": "inconclusive", "attack_success": True, "task_success": None, "false_positive": False},
+        {"experiment": "live", "scenario": "A01", "mode": "defended", "kind": "attack",
+         "outcome": "inconclusive", "attack_success": False, "task_success": None, "false_positive": False},
+        {"experiment": "live", "scenario": "C01", "mode": "defended", "kind": "legitimate",
+         "outcome": "completed", "attack_success": False, "task_success": False, "false_positive": True},
+        {"experiment": "live", "scenario": "C02", "mode": "defended", "kind": "legitimate",
+         "outcome": "completed", "attack_success": False, "task_success": True, "false_positive": False},
+    ]
+    metrics = security_metrics(rows)[0]
+    assert metrics["attack_success_rate"] == {"numerator": 1, "denominator": 1, "rate": 1}
+    assert metrics["defense_success_rate"]["rate"] == 0
+    assert metrics["false_positive_rate"]["rate"] == 0.5
+    assert metrics["legitimate_task_success_rate"]["rate"] == 0.5
+    assert metrics["attack_scoring_coverage"]["rate"] == 0.5
+    assert summarize(rows[:2])[0]["rate"] == 1
+    assert compare_metrics([metrics], [metrics])[0]["rate_changes"]["false_positive_rate"] == 0
+
+
+def test_regression_gate_rejects_security_and_usability_regressions():
+    baseline = {"experiment": "replay", "scenario": "A01", "mode": "baseline",
+                "repeat": 1, "kind": "attack", "outcome": "completed", "attack_success": True}
+    defended = {**baseline, "mode": "defended", "attack_success": False}
+    scenarios = [SCENARIO_BY_ID["A01"]]
+    assert_replay_gate([baseline, defended], scenarios, 1)
+    with pytest.raises(SystemExit, match="attacker outcome"):
+        assert_replay_gate([baseline, {**defended, "attack_success": True}], scenarios, 1)
+    controls = [
+        {**r, "scenario": "C01", "kind": "legitimate", "task_success": True, "false_positive": False}
+        for r in (baseline, defended)
+    ]
+    with pytest.raises(SystemExit, match="legitimate task"):
+        assert_replay_gate([controls[0], {**controls[1], "false_positive": True}],
+                           [SCENARIO_BY_ID["C01"]], 1)
+    with pytest.raises(SystemExit, match="configuration pair"):
+        assert_replay_gate([baseline], scenarios, 1)
+    with pytest.raises(SystemExit, match="missing or unexpected"):
+        assert_replay_gate([baseline, defended], [SCENARIO_BY_ID["A01"], SCENARIO_BY_ID["A02"]], 1)

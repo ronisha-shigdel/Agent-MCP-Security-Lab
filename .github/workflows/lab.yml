@@ -28,6 +28,16 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install -e ".[test]"
       - run: python -m pytest -q
+      - name: Run paired security and usability regression suite
+        run: python -m lab replay --repeats 1 --gate --output results/regression_ci.jsonl
+      - name: Upload regression evidence
+        if: always() && hashFiles('results/regression_ci*') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: regression-evidence
+          path: results/regression_ci*
+          if-no-files-found: error
+          retention-days: 7
 
   live:
     if: github.event_name == 'workflow_dispatch' && inputs.run_live
